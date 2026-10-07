@@ -15,7 +15,7 @@
 /**
  * @file storage_backend_bench.cpp
  * @brief Comprehensive benchmark for storage backends (OffsetAllocator, Bucket,
- * FilePerKey)
+ * FilePerKey, descriptor-based DFS)
  *
  * TESTS AVAILABLE:
  *   - init: Backend initialization time
@@ -76,10 +76,13 @@
 #include <iomanip>
 #include <iostream>
 #include <latch>
+#include <limits.h>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -93,6 +96,14 @@
 #include "gflags/gflags.h"
 #include "glog/logging.h"
 #include "storage_backend.h"
+#include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/immutable_bucket_allocator.h"
+#include "storage/distributed/posix_fs_adapter.h"
+#include "storage/distributed/shard_allocator.h"
+#ifdef USE_3FS
+#include <hf3fs_usrbio.h>
+#include "storage/distributed/hf3fs_adapter.h"
+#endif
 
 namespace fs = std::filesystem;
 
@@ -102,7 +113,13 @@ namespace fs = std::filesystem;
 
 // === Core Parameters ===
 DEFINE_string(backend, "offset_allocator",
-              "Backend type: offset_allocator, bucket, file_per_key, or all");
+              "Backend type: offset_allocator, bucket, file_per_key, dfs "
+              "(alias distributed), or all (local backends)");
+DEFINE_string(dfs_adapter, "hf3fs", "DFS adapter: hf3fs or posix");
+DEFINE_string(dfs_allocator, "shard", "DFS allocation layout: shard or bucket");
+DEFINE_uint32(dfs_file_count, 4,
+              "DFS shard count or maximum bucket count; capacity_gb is divided "
+              "equally across these files");
 DEFINE_uint64(value_size, 128 * 1024, "Value size in bytes (default: 128KB)");
 DEFINE_uint64(batch_size, 32, "Batch size for operations (default: 32)");
 DEFINE_uint64(num_operations, 1000,
@@ -242,7 +259,7 @@ AccessPattern StringToAccessPattern(const std::string& str) {
 // Backend Types
 // ============================================================================
 
-enum class BackendType { OFFSET_ALLOCATOR, BUCKET, FILE_PER_KEY };
+enum class BackendType { OFFSET_ALLOCATOR, BUCKET, FILE_PER_KEY, DFS };
 
 std::string BackendTypeToString(BackendType type) {
     switch (type) {
@@ -252,6 +269,8 @@ std::string BackendTypeToString(BackendType type) {
             return "bucket";
         case BackendType::FILE_PER_KEY:
             return "file_per_key";
+        case BackendType::DFS:
+            return "dfs";
     }
     return "unknown";
 }
@@ -260,6 +279,7 @@ BackendType StringToBackendType(const std::string& str) {
     if (str == "offset_allocator") return BackendType::OFFSET_ALLOCATOR;
     if (str == "bucket") return BackendType::BUCKET;
     if (str == "file_per_key") return BackendType::FILE_PER_KEY;
+    if (str == "dfs" || str == "distributed") return BackendType::DFS;
     LOG(FATAL) << "Unknown backend type: " << str;
     return BackendType::OFFSET_ALLOCATOR;
 }
@@ -464,6 +484,12 @@ class BenchmarkStats {
         }
         std::cout << "\n";
         std::cout << "  Ops/sec:        " << ops_per_sec << " (backend time)\n";
+        if (wall_clock_sec > 0) {
+            std::cout << "  Wall throughput: "
+                      << (static_cast<double>(total_bytes_) / MB) /
+                             wall_clock_sec
+                      << " MiB/s (all threads, including harness overhead)\n";
+        }
         std::cout << "\n  Latency (ms):   [n=" << n << "]\n";
         std::cout << "    Min:    " << std::setw(8) << min_lat << "\n";
         std::cout << "    Mean:   " << std::setw(8) << mean_lat << "\n";
@@ -831,6 +857,9 @@ std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
             return std::make_shared<mooncake::StorageBackendAdaptor>(
                 config, fpk_config);
         }
+        case BackendType::DFS:
+            // DFS uses explicit descriptors in RunDfsBenchmarks below.
+            break;
     }
     return nullptr;
 }
@@ -985,6 +1014,401 @@ inline bool ShouldVerify(size_t measured_op_index, bool is_warmup) {
     // verify_rate means "verify 1 in N operations"
     return (measured_op_index % FLAGS_verify_rate) == 0;
 }
+
+// DFS uses the real allocator to prepare descriptors, but does not start a
+// master or exercise metadata RPCs. Only BatchWrite/BatchRead are timed.
+namespace {
+
+size_t CheckedDfsProduct(size_t a, size_t b) {
+    if (b != 0 && a > std::numeric_limits<size_t>::max() / b) {
+        throw std::invalid_argument("DFS workload size overflows size_t");
+    }
+    return a * b;
+}
+
+void ValidateDfsBenchmark() {
+    if (FLAGS_run_all || (FLAGS_test != "all" && FLAGS_test != "init" &&
+                          FLAGS_test != "offload" && FLAGS_test != "load" &&
+                          FLAGS_test != "concurrent_load")) {
+        throw std::invalid_argument(
+            "DFS supports --test=init,offload,load,concurrent_load,all; "
+            "--run_all is only supported for local backends");
+    }
+    if (FLAGS_dfs_adapter != "posix" && FLAGS_dfs_adapter != "hf3fs") {
+        throw std::invalid_argument("--dfs_adapter must be posix or hf3fs");
+    }
+#ifndef USE_3FS
+    if (FLAGS_dfs_adapter == "hf3fs") {
+        throw std::invalid_argument("--dfs_adapter=hf3fs requires USE_3FS=ON");
+    }
+#endif
+    if (FLAGS_dfs_allocator != "shard" && FLAGS_dfs_allocator != "bucket") {
+        throw std::invalid_argument("--dfs_allocator must be shard or bucket");
+    }
+    if (FLAGS_cache_mode != "buffered" || FLAGS_flush_between_ops) {
+        throw std::invalid_argument(
+            "DFS does not implement cache-control or per-operation fsync; "
+            "use --cache_mode=buffered --flush_between_ops=false");
+    }
+    if (FLAGS_dfs_file_count == 0 || FLAGS_dfs_file_count > INT32_MAX ||
+        FLAGS_capacity_gb == 0 ||
+        FLAGS_capacity_gb > std::numeric_limits<size_t>::max() / GB ||
+        FLAGS_value_size == 0 ||
+        FLAGS_value_size > std::numeric_limits<size_t>::max() - kAlignment ||
+        FLAGS_batch_size == 0 || FLAGS_num_operations == 0 ||
+        FLAGS_num_threads == 0 || FLAGS_verify_rate == 0 ||
+        FLAGS_warmup_operations >
+            std::numeric_limits<size_t>::max() - FLAGS_num_operations) {
+        throw std::invalid_argument(
+            "Invalid or overflowing DFS workload parameters");
+    }
+    const size_t capacity = FLAGS_capacity_gb * GB;
+    const size_t file_capacity =
+        (capacity / FLAGS_dfs_file_count) & ~(kAlignment - 1);
+    if (file_capacity < AlignUp(FLAGS_value_size, kAlignment) ||
+        file_capacity > static_cast<uint64_t>(INT64_MAX)) {
+        throw std::invalid_argument(
+            "DFS value does not fit the per-file capacity");
+    }
+    const size_t threads =
+        (FLAGS_test == "all" || FLAGS_test == "concurrent_load")
+            ? FLAGS_num_threads
+            : 1;
+    const size_t keys = CheckedDfsProduct(
+        CheckedDfsProduct(FLAGS_num_operations + FLAGS_warmup_operations,
+                          FLAGS_batch_size),
+        threads);
+    if (FLAGS_test != "init" &&
+        keys > capacity / AlignUp(FLAGS_value_size, kAlignment)) {
+        throw std::invalid_argument(
+            "DFS dataset including warmup exceeds --capacity_gb; "
+            "reduce the workload or increase capacity");
+    }
+}
+
+// Each DFS test owns only this unique child directory. Never run the legacy
+// CleanupStoragePath on a shared DFS root or on a directory managed by a
+// master.
+class DfsBenchmarkDirectory {
+   public:
+    DfsBenchmarkDirectory() {
+        fs::create_directories(FLAGS_storage_path);
+#ifdef USE_3FS
+        if (FLAGS_dfs_adapter == "hf3fs") {
+            char mount[PATH_MAX];
+            const int length = hf3fs_extract_mount_point(
+                mount, sizeof(mount), FLAGS_storage_path.c_str());
+            if (length <= 0 || length > static_cast<int>(sizeof(mount))) {
+                throw std::invalid_argument(
+                    "--dfs_adapter=hf3fs requires --storage_path on a 3FS "
+                    "mount");
+            }
+        }
+#endif
+        auto pattern =
+            (fs::canonical(FLAGS_storage_path) / "dfs-bench-XXXXXX").string();
+        if (!::mkdtemp(pattern.data())) {
+            throw std::runtime_error("Cannot create DFS benchmark directory: " +
+                                     std::string(std::strerror(errno)));
+        }
+        path = std::move(pattern);
+        std::cout << "  DFS test directory: " << path << "\n";
+    }
+    ~DfsBenchmarkDirectory() {
+        if (FLAGS_skip_cleanup) return;
+        std::error_code ec;
+        fs::remove_all(path, ec);
+        if (ec) LOG(ERROR) << "DFS test cleanup failed: " << ec.message();
+    }
+    std::string path;
+};
+
+std::unique_ptr<mooncake::FileSystemAdapter> MakeDfsBenchmarkAdapter() {
+#ifdef USE_3FS
+    if (FLAGS_dfs_adapter == "hf3fs") {
+        return std::make_unique<mooncake::Hf3fsAdapter>();
+    }
+#endif
+    return std::make_unique<mooncake::PosixFsAdapter>();
+}
+
+// Reuse the existing buffer pool and deterministic data generator. Building
+// requests and filling/verifying buffers happen outside each operation timer.
+struct DfsBenchmarkBatch {
+    BufferPool buffers;
+    DataGenerator generator;
+    std::vector<mooncake::DfsWriteRequest> writes;
+    std::vector<mooncake::DfsReadRequest> reads;
+    size_t first_key = 0;
+
+    DfsBenchmarkBatch() {
+        buffers.Init(FLAGS_batch_size, FLAGS_value_size);
+        writes.resize(FLAGS_batch_size);
+        reads.resize(FLAGS_batch_size);
+        for (size_t i = 0; i < writes.size(); ++i) {
+            writes[i].slices = {{buffers.Get(i), FLAGS_value_size}};
+            reads[i].slices = writes[i].slices;
+        }
+    }
+
+    void Prepare(
+        const KeySet& keys,
+        const std::vector<mooncake::DistributedFSDescriptor>& descriptors,
+        size_t first, bool read) {
+        first_key = first;
+        for (size_t i = 0; i < writes.size(); ++i) {
+            const size_t key = first + i;
+            if (read) {
+                reads[i].key = keys.Get(key);
+                reads[i].descriptor = descriptors[key];
+                std::memset(buffers.Get(i), 0xa5, FLAGS_value_size);
+            } else {
+                writes[i].key = keys.Get(key);
+                writes[i].descriptor = descriptors[key];
+                generator.FillBuffer(buffers.Get(i), FLAGS_value_size, key);
+            }
+        }
+    }
+
+    size_t Verify() {
+        size_t failures = 0;
+        for (size_t i = 0; i < reads.size(); ++i) {
+            failures += !generator.VerifyBuffer(
+                buffers.Get(i), FLAGS_value_size, first_key + i);
+        }
+        if (failures)
+            LOG(ERROR) << "DFS data verification failed for " << failures
+                       << " keys in batch starting at " << first_key;
+        return failures;
+    }
+};
+
+size_t CheckDfsIoResults(
+    const std::vector<tl::expected<void, mooncake::ErrorCode>>& results,
+    size_t expected) {
+    if (results.size() != expected) {
+        LOG(ERROR) << "DFS returned " << results.size() << " results for "
+                   << expected << " requests";
+        return 0;
+    }
+    size_t successes = 0;
+    for (const auto& result : results) {
+        if (result) {
+            ++successes;
+        } else {
+            LOG(ERROR) << "DFS I/O failed: " << result.error();
+        }
+    }
+    return successes;
+}
+
+bool BenchDfs(const std::string& test) {
+    const bool read = test != "offload";
+    const size_t threads = test == "concurrent_load" ? FLAGS_num_threads : 1;
+    const size_t operations = FLAGS_warmup_operations + FLAGS_num_operations;
+    const size_t keys_per_thread =
+        CheckedDfsProduct(operations, FLAGS_batch_size);
+    const size_t key_count = CheckedDfsProduct(keys_per_thread, threads);
+    PrintHeader("DFS_" + test, BackendType::DFS, FLAGS_value_size,
+                FLAGS_batch_size, threads);
+    DfsBenchmarkDirectory directory;
+    mooncake::DistributedStorageConfig config;
+    config.fsdir = directory.path;
+    config.fs_adapter_type = FLAGS_dfs_adapter;
+    config.allocator_type = FLAGS_dfs_allocator;
+    config.shard_count = FLAGS_dfs_file_count;
+    config.max_bucket_count = FLAGS_dfs_file_count;
+    config.shard_capacity = config.bucket_capacity =
+        ((FLAGS_capacity_gb * GB) / FLAGS_dfs_file_count) & ~(kAlignment - 1);
+    config.alignment = kAlignment;
+    config.eviction_enabled = false;
+    std::unique_ptr<mooncake::DfsAllocatorInterface> allocator;
+    if (config.allocator_type == "bucket") {
+        allocator = std::make_unique<mooncake::ImmutableBucketAllocator>();
+    } else {
+        allocator = std::make_unique<mooncake::ShardAllocator>();
+    }
+    mooncake::FileStorageConfig file_config;
+    file_config.storage_backend_type =
+        mooncake::StorageBackendType::kDistributed;
+    file_config.storage_filepath = directory.path;
+    mooncake::DistributedStorageBackend backend(file_config, config,
+                                                MakeDfsBenchmarkAdapter());
+    const auto init_start = std::chrono::steady_clock::now();
+    const auto allocated = allocator->Init(config);
+    if (!allocated) {
+        LOG(ERROR) << "DFS allocator initialization failed: "
+                   << allocated.error();
+        return false;
+    }
+    const auto initialized = backend.Init();
+    if (!initialized) {
+        LOG(ERROR) << "DFS backend initialization failed: "
+                   << initialized.error();
+        return false;
+    }
+    std::cout << "  DFS adapter: " << config.fs_adapter_type
+              << ", allocator: " << config.allocator_type
+              << ", file capacity: " << config.shard_capacity
+              << ", file limit: " << FLAGS_dfs_file_count << "\n";
+    if (test == "init") {
+        std::cout << "  Init time (allocator + backend): "
+                  << std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - init_start)
+                         .count()
+                  << " ms\n";
+        return true;
+    }
+
+    KeySet keys;
+    keys.Init(key_count);
+    std::vector<mooncake::DistributedFSDescriptor> descriptors;
+    descriptors.reserve(key_count);
+    for (size_t i = 0; i < key_count; ++i) {
+        auto descriptor = allocator->Allocate(keys.Get(i), FLAGS_value_size);
+        if (!descriptor) {
+            LOG(ERROR) << "DFS allocation failed for key " << i << ": "
+                       << descriptor.error();
+            return false;
+        }
+        descriptors.push_back(std::move(*descriptor));
+    }
+    auto commit = [&](const DfsBenchmarkBatch& batch) {
+        if (config.allocator_type != "bucket") return true;
+        auto& buckets =
+            static_cast<mooncake::ImmutableBucketAllocator&>(*allocator);
+        for (const auto& request : batch.writes) {
+            if (!buckets.MarkCommitted(request.key, request.descriptor)) {
+                LOG(ERROR) << "DFS bucket commit failed for " << request.key;
+                return false;
+            }
+        }
+        return true;
+    };
+    if (read) {
+        DfsBenchmarkBatch batch;
+        for (size_t first = 0; first < key_count; first += FLAGS_batch_size) {
+            batch.Prepare(keys, descriptors, first, false);
+            if (CheckDfsIoResults(backend.BatchWrite(batch.writes),
+                                  FLAGS_batch_size) != FLAGS_batch_size ||
+                !commit(batch))
+                return false;
+        }
+    }
+    std::cout << "  Dataset: " << key_count << " keys; " << FLAGS_num_operations
+              << " measured batches + " << FLAGS_warmup_operations
+              << " warmup batches per thread\n";
+
+    BenchmarkStats stats;
+    stats.InitThreads(threads, FLAGS_num_operations);
+    std::atomic<bool> failed{false}, stop{false};
+    std::latch ready(threads), start(1), measured_done(threads),
+        verify_start(1);
+    std::vector<std::thread> workers;
+    for (size_t t = 0; t < threads; ++t) {
+        workers.emplace_back([&, t] {
+            DfsBenchmarkBatch batch;
+            auto& local_stats = stats.GetThreadStats(t);
+            auto run = [&](size_t op, bool warmup) {
+                batch.Prepare(keys, descriptors,
+                              t * keys_per_thread + op * FLAGS_batch_size,
+                              read);
+                const auto begin = std::chrono::steady_clock::now();
+                auto results = read ? backend.BatchRead(batch.reads)
+                                    : backend.BatchWrite(batch.writes);
+                const auto end = std::chrono::steady_clock::now();
+                const size_t successes =
+                    CheckDfsIoResults(results, FLAGS_batch_size);
+                const bool ok =
+                    successes == FLAGS_batch_size && (read || commit(batch));
+                if (!warmup) {
+                    local_stats.RecordLatency(
+                        std::chrono::duration<double, std::milli>(end - begin)
+                            .count());
+                    local_stats.RecordOperation();
+                    local_stats.RecordBytes(successes * FLAGS_value_size);
+                    if (!ok) local_stats.RecordError();
+                }
+                if (!ok) {
+                    failed = true;
+                    stop = true;
+                }
+                if (read && ok &&
+                    ShouldVerify(warmup ? op : op - FLAGS_warmup_operations,
+                                 warmup)) {
+                    const size_t errors = batch.Verify();
+                    local_stats.checksum_failures += errors;
+                    if (errors) {
+                        failed = true;
+                        if (FLAGS_fail_fast) stop = true;
+                    }
+                }
+            };
+            for (size_t op = 0; op < FLAGS_warmup_operations && !stop; ++op)
+                run(op, true);
+            ready.count_down();
+            start.wait();
+            for (size_t op = FLAGS_warmup_operations; op < operations && !stop;
+                 ++op) {
+                run(op, false);
+            }
+            measured_done.count_down();
+            verify_start.wait();
+            // Write readback runs after the wall-clock measurement as well.
+            if (!read && FLAGS_verify && !stop) {
+                for (size_t op = 0; op < operations; ++op) {
+                    const bool warmup = op < FLAGS_warmup_operations;
+                    if (!ShouldVerify(
+                            warmup ? op : op - FLAGS_warmup_operations, warmup))
+                        continue;
+                    batch.Prepare(keys, descriptors,
+                                  t * keys_per_thread + op * FLAGS_batch_size,
+                                  true);
+                    if (CheckDfsIoResults(backend.BatchRead(batch.reads),
+                                          FLAGS_batch_size) !=
+                        FLAGS_batch_size) {
+                        local_stats.RecordError();
+                        failed = true;
+                        break;
+                    }
+                    const size_t errors = batch.Verify();
+                    local_stats.checksum_failures += errors;
+                    if (errors) {
+                        failed = true;
+                        if (FLAGS_fail_fast) break;
+                    }
+                }
+            }
+        });
+    }
+    ready.wait();
+    stats.StartTimer();
+    start.count_down();
+    measured_done.wait();
+    stats.StopTimer();
+    verify_start.count_down();
+    for (auto& worker : workers) worker.join();
+    stats.Finalize();
+    stats.PrintStatistics("DFS_" + test);
+    return !failed;
+}
+
+int RunDfsBenchmarks() {
+    try {
+        ValidateDfsBenchmark();
+        for (const auto* test :
+             {"init", "offload", "load", "concurrent_load"}) {
+            if ((FLAGS_test == test || FLAGS_test == "all") && !BenchDfs(test))
+                return 1;
+        }
+        return 0;
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "DFS benchmark failed: " << error.what();
+        return 1;
+    }
+}
+
+}  // namespace
 
 // ============================================================================
 // Benchmark: Init
@@ -2369,6 +2793,12 @@ int main(int argc, char** argv) {
     google::InitGoogleLogging("StorageBackendBench");
     FLAGS_logtostderr = true;
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+
+    if (FLAGS_backend == "dfs" || FLAGS_backend == "distributed") {
+        const int result = RunDfsBenchmarks();
+        google::ShutdownGoogleLogging();
+        return result;
+    }
 
     std::string storage_path = FLAGS_storage_path;
     size_t capacity = FLAGS_capacity_gb * GB;

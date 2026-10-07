@@ -147,6 +147,9 @@ TEST_F(Hf3fsAdapterTest, DistributedBackendBatchWriteAndRead) {
     distributed_config.alignment = 4096;
     distributed_config.single_tenant = true;
 
+    ShardAllocator allocator;
+    ASSERT_TRUE(allocator.Init(distributed_config).has_value());
+
     DistributedStorageBackend backend(file_config, distributed_config,
                                       std::make_unique<Hf3fsAdapter>());
     ASSERT_TRUE(backend.Init().has_value());
@@ -156,19 +159,15 @@ TEST_F(Hf3fsAdapterTest, DistributedBackendBatchWriteAndRead) {
     write_buf.fill('B');
 
     const std::string key = "hf3fs_backend_key";
-    const std::string shard_path = test_dir_->file(
-        "dfs_shard_" +
-        ShardAllocator::FormatShardIdx(0, distributed_config.shard_count) +
-        ".data");
-    DistributedFSDescriptor descriptor{shard_path, 0, write_buf.size(),
-                                       write_buf.size(), 0};
+    auto descriptor = allocator.Allocate(key, write_buf.size());
+    ASSERT_TRUE(descriptor.has_value());
     auto write = backend.BatchWrite(
-        {{key, descriptor, {{write_buf.data(), write_buf.size()}}}});
+        {{key, *descriptor, {{write_buf.data(), write_buf.size()}}}});
     ASSERT_EQ(write.size(), 1);
     ASSERT_TRUE(write[0].has_value());
 
     auto read = backend.BatchRead(
-        {{key, descriptor, {{read_buf.data(), read_buf.size()}}}});
+        {{key, *descriptor, {{read_buf.data(), read_buf.size()}}}});
     ASSERT_EQ(read.size(), 1);
     ASSERT_TRUE(read[0].has_value());
     EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), write_buf.size()),

@@ -23,13 +23,26 @@ target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator
 add_executable(file_interface_bench file_interface_bench.cpp)
 target_link_libraries(file_interface_bench PRIVATE mooncake_store glog::glog)
 
-# Add storage backend benchmark executable
-# This benchmark tests all storage backends (OffsetAllocator, Bucket, FilePerKey)
-# with realistic KV cache workloads for LLM inference scenarios
+# Benchmark local storage backends and descriptor-based DFS I/O.
 add_executable(storage_backend_bench storage_backend_bench.cpp)
 target_link_libraries(
   storage_backend_bench PRIVATE mooncake_store cachelib_memory_allocator
                                 gflags::gflags glog::glog pthread)
+
+if(BUILD_UNIT_TESTS)
+  foreach(layout shard bucket)
+    add_test(
+      NAME storage_backend_dfs_${layout}_smoke
+      COMMAND
+        storage_backend_bench --backend=dfs --dfs_adapter=posix
+        --dfs_allocator=${layout} --test=all --capacity_gb=1 --dfs_file_count=2
+        --value_size=4097 --batch_size=19 --num_operations=2
+        --warmup_operations=1 --num_threads=2
+        --storage_path=${CMAKE_CURRENT_BINARY_DIR}/dfs-bench-tests)
+    set_tests_properties(storage_backend_dfs_${layout}_smoke PROPERTIES TIMEOUT
+                                                                        120)
+  endforeach()
+endif()
 
 # Add allocation strategy benchmark executable
 # This benchmark tests AllocationStrategy performance with configurable
