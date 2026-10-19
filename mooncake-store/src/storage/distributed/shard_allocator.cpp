@@ -17,6 +17,7 @@
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
+#include "storage/distributed/hf3fs_native_adapter.h"
 
 namespace mooncake {
 
@@ -77,6 +78,8 @@ tl::expected<void, ErrorCode> ShardAllocator::Init(
                       "(-DUSE_3FS=ON)";
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
 #endif
+    } else if (config.fs_adapter_type == "hf3fs_native") {
+        fs_adapter_ = std::make_unique<Hf3fsNativeAdapter>();
     }
 
     auto adapter_init = fs_adapter_->Init(mount_path_);

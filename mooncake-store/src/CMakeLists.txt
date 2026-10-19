@@ -15,6 +15,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     config/store_cluster_identity_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
+    storage/distributed/hf3fs_native_adapter.cpp
     common/file_util.cpp)
 
 set(MOONCAKE_STORE_MASTER_SOURCES
@@ -170,6 +171,8 @@ if(BUILD_UNIT_TESTS)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv/executor_stub.cpp)
 endif()
 set(EXTRA_LIBS "")
+# Hf3fsNativeAdapter loads its 3FS client library at runtime.
+list(APPEND EXTRA_LIBS ${CMAKE_DL_LIBS})
 set(SPDK_STATIC_LIBS "")
 
 # RISC-V toolchains may implement 16-byte atomic operations in libatomic rather

@@ -61,6 +61,7 @@ struct FdGuard {
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
+#include "storage/distributed/hf3fs_native_adapter.h"
 
 namespace mooncake {
 
@@ -5635,6 +5636,8 @@ CreateStorageBackend(const FileStorageConfig& config) {
 #else
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 #endif
+            } else if (distributed_config.fs_adapter_type == "hf3fs_native") {
+                fs_adapter = std::make_unique<Hf3fsNativeAdapter>();
             } else if (distributed_config.fs_adapter_type == "oss") {
 #ifdef HAVE_OSS_ADAPTER
                 object_storage_adapter =

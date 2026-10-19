@@ -1,0 +1,6 @@
+{
+  global:
+    mc_hf3fs_get_api;
+  local:
+    *;
+};

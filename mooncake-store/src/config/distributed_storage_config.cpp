@@ -40,8 +40,8 @@ bool DistributedStorageConfig::Validate() const {
             << fsdir;
         return false;
     }
-    if (fs_adapter_type != "hf3fs" && fs_adapter_type != "posix" &&
-        !UsesObjectStorage()) {
+    if (fs_adapter_type != "hf3fs" && fs_adapter_type != "hf3fs_native" &&
+        fs_adapter_type != "posix" && !UsesObjectStorage()) {
         LOG(ERROR) << "DistributedStorageConfig: unsupported fs_adapter_type: "
                    << fs_adapter_type;
         return false;

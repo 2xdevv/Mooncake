@@ -315,6 +315,8 @@ set_tests_properties(dfs_read_checksum_test
 if(USE_3FS)
   add_store_test(dfs_hf3fs_test dfs_hf3fs_test.cpp)
 endif()
+add_store_test(hf3fs_native_adapter_test hf3fs_native_adapter_test.cpp)
+add_store_test(dfs_hf3fs_native_test dfs_hf3fs_native_test.cpp)
 add_store_test(zstd_util_test zstd_util_test.cpp)
 add_store_test(local_file_snapshot_config_test
                local_file_snapshot_config_test.cpp)

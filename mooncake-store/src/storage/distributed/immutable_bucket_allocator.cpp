@@ -13,6 +13,7 @@
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
+#include "storage/distributed/hf3fs_native_adapter.h"
 
 namespace mooncake {
 namespace {
@@ -87,6 +88,8 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
 #else
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
 #endif
+    } else if (config.fs_adapter_type == "hf3fs_native") {
+        adapter = std::make_unique<Hf3fsNativeAdapter>();
     } else {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
