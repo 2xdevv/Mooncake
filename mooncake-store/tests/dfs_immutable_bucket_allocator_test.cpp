@@ -1,12 +1,16 @@
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -14,9 +18,58 @@
 #include "config/distributed_storage_config.h"
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
+#include "storage/distributed/posix_fs_adapter.h"
 
 namespace mooncake {
 namespace {
+
+// Holds bucket creation open until released, standing in for a filesystem
+// whose create and resize take metadata round trips.
+struct PreallocateGate {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool hold = false;
+    bool fail_next = false;
+    int started = 0;
+
+    void Hold() {
+        std::lock_guard lock(mutex);
+        hold = true;
+    }
+    void Release() {
+        std::lock_guard lock(mutex);
+        hold = false;
+        changed.notify_all();
+    }
+    bool WaitStarted(int count) {
+        std::unique_lock lock(mutex);
+        return changed.wait_for(lock, std::chrono::seconds(10),
+                                [&] { return started >= count; });
+    }
+};
+
+class GatedPosixAdapter : public PosixFsAdapter {
+   public:
+    explicit GatedPosixAdapter(std::shared_ptr<PreallocateGate> gate)
+        : gate_(std::move(gate)) {}
+
+    tl::expected<void, ErrorCode> PreallocateFile(const std::string& path,
+                                                  uint64_t size) override {
+        bool fail = false;
+        {
+            std::unique_lock lock(gate_->mutex);
+            ++gate_->started;
+            gate_->changed.notify_all();
+            gate_->changed.wait(lock, [&] { return !gate_->hold; });
+            fail = std::exchange(gate_->fail_next, false);
+        }
+        if (fail) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return PosixFsAdapter::PreallocateFile(path, size);
+    }
+
+   private:
+    std::shared_ptr<PreallocateGate> gate_;
+};
 
 class TempDir {
    public:
@@ -355,6 +408,81 @@ TEST(ImmutableBucketAllocatorTest, RejectsExistingBucketArtifacts) {
     auto initialized = allocator.Init(BucketConfig(dir));
     ASSERT_FALSE(initialized);
     EXPECT_EQ(initialized.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST(ImmutableBucketAllocatorTest, BucketCreationDoesNotBlockOtherCalls) {
+    TempDir dir;
+    auto config = BucketConfig(dir);
+    config.bucket_capacity = 4096;
+    auto gate = std::make_shared<PreallocateGate>();
+    ImmutableBucketAllocator allocator;
+    ASSERT_TRUE(
+        allocator.Init(config, std::make_unique<GatedPosixAdapter>(gate)));
+
+    auto committed = allocator.Allocate("committed", 100);
+    auto pending = allocator.Allocate("pending", 100);
+    auto freed = allocator.Allocate("freed", 100);
+    ASSERT_TRUE(committed);
+    ASSERT_TRUE(pending);
+    ASSERT_TRUE(freed);
+    ASSERT_TRUE(allocator.MarkCommitted("committed", *committed));
+
+    // The active bucket is full, so the next allocation creates a bucket.
+    gate->Hold();
+    auto creating = std::async(std::launch::async,
+                               [&] { return allocator.Allocate("next", 100); });
+    ASSERT_TRUE(gate->WaitStarted(4));
+
+    auto others = std::async(std::launch::async, [&] {
+        allocator.UpdateAccess("committed", *committed);
+        allocator.Free("freed", *freed);
+        const bool marked = allocator.MarkCommitted("pending", *pending);
+        allocator.AbortEviction(allocator.PrepareEviction());
+        return marked && allocator.GetUsedBytes() == 3 * config.bucket_capacity;
+    });
+    const auto status = others.wait_for(std::chrono::seconds(10));
+    gate->Release();
+    ASSERT_EQ(status, std::future_status::ready);
+    EXPECT_TRUE(others.get());
+    auto next = creating.get();
+    ASSERT_TRUE(next);
+    EXPECT_EQ(next->shard_idx, 3);
+    EXPECT_EQ(allocator.GetBucketCount(), 4u);
+}
+
+TEST(ImmutableBucketAllocatorTest, WaitersRetryAfterFailedBucketCreation) {
+    TempDir dir;
+    auto config = BucketConfig(dir);
+    auto gate = std::make_shared<PreallocateGate>();
+    ImmutableBucketAllocator allocator;
+    ASSERT_TRUE(
+        allocator.Init(config, std::make_unique<GatedPosixAdapter>(gate)));
+
+    gate->Hold();
+    gate->fail_next = true;
+    auto failed = std::async(std::launch::async,
+                             [&] { return allocator.Allocate("a", 100); });
+    ASSERT_TRUE(gate->WaitStarted(1));
+    // These wait for the creation in flight instead of starting their own.
+    auto first = std::async(std::launch::async,
+                            [&] { return allocator.Allocate("b", 100); });
+    auto second = std::async(std::launch::async,
+                             [&] { return allocator.Allocate("c", 100); });
+    gate->Release();
+
+    auto failed_result = failed.get();
+    ASSERT_FALSE(failed_result);
+    EXPECT_EQ(failed_result.error(), ErrorCode::FILE_WRITE_FAIL);
+    auto first_result = first.get();
+    auto second_result = second.get();
+    ASSERT_TRUE(first_result);
+    ASSERT_TRUE(second_result);
+    // One retried creation serves both waiters.
+    EXPECT_EQ(first_result->shard_idx, second_result->shard_idx);
+    EXPECT_EQ(allocator.GetBucketCount(), 1u);
+    EXPECT_EQ(first_result->shard_idx, 1);
+    EXPECT_EQ(gate->started, 2);
+    EXPECT_FALSE(std::filesystem::exists(dir.file("bucket_000000.data")));
 }
 
 TEST(ImmutableBucketAllocatorTest, ConcurrentAllocationDoesNotOverlap) {

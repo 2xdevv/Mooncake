@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <list>
 #include <memory>
@@ -54,6 +55,10 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     DfsAllocatorType Type() const override { return DfsAllocatorType::BUCKET; }
     tl::expected<void, ErrorCode> Init(
         const DistributedStorageConfig& config) override;
+    // Uses `adapter` instead of creating one from config.fs_adapter_type.
+    tl::expected<void, ErrorCode> Init(
+        const DistributedStorageConfig& config,
+        std::unique_ptr<FileSystemAdapter> adapter);
     bool IsInitialized() const override {
         return initialized_.load(std::memory_order_acquire);
     }
@@ -160,8 +165,9 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     using BucketPtr = std::shared_ptr<BucketState>;
 
     std::string BucketDataPath(int64_t bucket_id) const;
+    // Releases `lock` while it creates a bucket file.
     tl::expected<BucketPtr, ErrorCode> EnsureActiveBucketLocked(
-        uint64_t required);
+        std::unique_lock<std::mutex>& lock, uint64_t required);
     tl::expected<DistributedFSDescriptor, ErrorCode> ReserveInBucketLocked(
         BucketState& bucket, const std::string& key, uint64_t size);
     BucketEntry* FindMatchingEntryLocked(
@@ -195,6 +201,10 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         waiting_deletions_;
     int64_t active_bucket_id_ = -1;
     int64_t next_bucket_id_ = 0;
+    // Set while one caller creates the next bucket file without the lock;
+    // others that need a bucket wait for bucket_created_.
+    bool creating_bucket_ = false;
+    std::condition_variable bucket_created_;
     bool eviction_active_ = false;
     std::atomic<bool> initialized_{false};
 };

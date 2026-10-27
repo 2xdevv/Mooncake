@@ -69,14 +69,6 @@ ImmutableBucketAllocator::~ImmutableBucketAllocator() {
 tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     const DistributedStorageConfig& config) {
     if (initialized_.load(std::memory_order_acquire)) return {};
-    if (!config.ValidateForAllocator() ||
-        config.bucket_capacity >
-            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
-        config.bucket_capacity >
-            std::numeric_limits<uint64_t>::max() /
-                static_cast<uint64_t>(config.max_bucket_count)) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
 
     std::unique_ptr<FileSystemAdapter> adapter;
     if (config.fs_adapter_type == "posix") {
@@ -88,6 +80,21 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
 #endif
     } else {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return Init(config, std::move(adapter));
+}
+
+tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
+    const DistributedStorageConfig& config,
+    std::unique_ptr<FileSystemAdapter> adapter) {
+    if (initialized_.load(std::memory_order_acquire)) return {};
+    if (!adapter || !config.ValidateForAllocator() ||
+        config.bucket_capacity >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+        config.bucket_capacity >
+            std::numeric_limits<uint64_t>::max() /
+                static_cast<uint64_t>(config.max_bucket_count)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -133,25 +140,31 @@ std::string ImmutableBucketAllocator::BucketDataPath(int64_t bucket_id) const {
 }
 
 tl::expected<ImmutableBucketAllocator::BucketPtr, ErrorCode>
-ImmutableBucketAllocator::EnsureActiveBucketLocked(uint64_t required) {
+ImmutableBucketAllocator::EnsureActiveBucketLocked(
+    std::unique_lock<std::mutex>& lock, uint64_t required) {
     if (required == 0 || required > bucket_capacity_) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (active_bucket_id_ >= 0) {
-        const auto current = buckets_.find(active_bucket_id_);
-        if (current != buckets_.end() &&
-            current->second->lifecycle == BucketLifecycle::ACTIVE &&
-            current->second->append_offset <= current->second->capacity &&
-            required <=
-                current->second->capacity - current->second->append_offset) {
-            return current->second;
+    while (true) {
+        if (active_bucket_id_ >= 0) {
+            const auto current = buckets_.find(active_bucket_id_);
+            if (current != buckets_.end() &&
+                current->second->lifecycle == BucketLifecycle::ACTIVE &&
+                current->second->append_offset <= current->second->capacity &&
+                required <= current->second->capacity -
+                                current->second->append_offset) {
+                return current->second;
+            }
+            if (current != buckets_.end() &&
+                current->second->lifecycle == BucketLifecycle::ACTIVE) {
+                current->second->lifecycle = BucketLifecycle::SEALED;
+                TouchLruLocked(current->first);
+            }
+            active_bucket_id_ = -1;
         }
-        if (current != buckets_.end() &&
-            current->second->lifecycle == BucketLifecycle::ACTIVE) {
-            current->second->lifecycle = BucketLifecycle::SEALED;
-            TouchLruLocked(current->first);
-        }
-        active_bucket_id_ = -1;
+        if (!creating_bucket_) break;
+        // The bucket being created may fit this request too.
+        bucket_created_.wait(lock);
     }
 
     if (next_bucket_id_ > kMaxBucketId) {
@@ -165,6 +178,12 @@ ImmutableBucketAllocator::EnsureActiveBucketLocked(uint64_t required) {
 
     const int64_t bucket_id = next_bucket_id_++;
     const std::string path = BucketDataPath(bucket_id);
+    // Creating the file takes filesystem metadata round trips (tens of
+    // milliseconds on 3FS). Commits, frees, access updates and eviction must
+    // not wait for it, so it runs without the lock; only one creation runs at
+    // a time, which keeps the bucket count within max_bucket_count_.
+    creating_bucket_ = true;
+    lock.unlock();
     auto preallocated = fs_adapter_->PreallocateFile(path, bucket_capacity_);
     if (!preallocated) {
         auto cleaned = fs_adapter_->DeleteFile(path);
@@ -172,8 +191,11 @@ ImmutableBucketAllocator::EnsureActiveBucketLocked(uint64_t required) {
             LOG(WARNING) << "Failed to clean up unpublished DFS bucket " << path
                          << ": " << cleaned.error();
         }
-        return tl::make_unexpected(preallocated.error());
     }
+    lock.lock();
+    creating_bucket_ = false;
+    bucket_created_.notify_all();
+    if (!preallocated) return tl::make_unexpected(preallocated.error());
 
     auto bucket = std::make_shared<BucketState>();
     bucket->id = bucket_id;
@@ -225,11 +247,11 @@ ImmutableBucketAllocator::Allocate(const std::string& key, uint64_t size) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (key_index_.contains(key)) {
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
-    auto bucket_result = EnsureActiveBucketLocked(layout->aligned_size);
+    auto bucket_result = EnsureActiveBucketLocked(lock, layout->aligned_size);
     if (!bucket_result) {
         return tl::make_unexpected(bucket_result.error());
     }
@@ -251,7 +273,10 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
         return results;
     }
 
-    std::lock_guard lock(mutex_);
+    // Creating a bucket releases the lock, so other calls may run between this
+    // batch's reservations. Its pending entries keep their buckets from
+    // eviction, and a failure still tombstones every reservation it made.
+    std::unique_lock lock(mutex_);
     ErrorCode failure = ErrorCode::OK;
     size_t completed = 0;
     for (; completed < requests.size(); ++completed) {
@@ -267,7 +292,8 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
             failure = ErrorCode::OBJECT_ALREADY_EXISTS;
             break;
         }
-        auto bucket_result = EnsureActiveBucketLocked(layout->aligned_size);
+        auto bucket_result =
+            EnsureActiveBucketLocked(lock, layout->aligned_size);
         if (!bucket_result) {
             failure = bucket_result.error();
             break;
